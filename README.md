@@ -8,7 +8,30 @@ XPASS is a **Flask + MySQL** based password management system built for **secure
 It offers **encrypted password storage**, **folder-based organization**, **optional 2FA**, and an **Admin Dashboard** for managing users and auditing system activity.
 
 ---
+---
 
+## 🧭 Features Overview
+
+### 🧑‍💼 Admin Panel
+- 👥 Manage Users – Create, reset, disable accounts  
+- 🔐 2FA Control – Enable or disable Two-Factor Authentication  
+- 📊 Audit Dashboard – View users, folders, admins, and recent logins  
+
+### 📁 Folder Management
+- 🗂️ Folder-based credential organization  
+- 🤝 Secure folder sharing with other users  
+- 📤 Import / 📥 Export folder data  
+
+### 🛡️ Security Highlights
+- ✅ **Encrypted Storage** – AES encryption for every credential  
+- ✅ **Self-Hosted Privacy** – Full control of data  
+- ✅ **Optional 2FA** – Add another security layer  
+- ✅ **Audit Overview** – System activity and stats  
+- ✅ **Offline & LAN-Friendly** – No Internet required  
+- ✅ **Lightweight & Fast** – Pure Flask stack  
+- ✅ **Modern UI** – Responsive, Bootstrap-based  
+
+---
 ## 🚀 Quick Setup Guide
 
 ### 🧩 1. Clone the Repository
@@ -108,30 +131,7 @@ http://127.0.0.1:5000
 - Session cookies are HTTPOnly and Same-Site protected
 - Encryption uses **PBKDF2 + Fernet (AES-128)**
 
----
 
-## 🧭 Features Overview
-
-### 🧑‍💼 Admin Panel
-- 👥 Manage Users – Create, reset, disable accounts  
-- 🔐 2FA Control – Enable or disable Two-Factor Authentication  
-- 📊 Audit Dashboard – View users, folders, admins, and recent logins  
-
-### 📁 Folder Management
-- 🗂️ Folder-based credential organization  
-- 🤝 Secure folder sharing with other users  
-- 📤 Import / 📥 Export folder data  
-
-### 🛡️ Security Highlights
-- ✅ **Encrypted Storage** – AES encryption for every credential  
-- ✅ **Self-Hosted Privacy** – Full control of data  
-- ✅ **Optional 2FA** – Add another security layer  
-- ✅ **Audit Overview** – System activity and stats  
-- ✅ **Offline & LAN-Friendly** – No Internet required  
-- ✅ **Lightweight & Fast** – Pure Flask stack  
-- ✅ **Modern UI** – Responsive, Bootstrap-based  
-
----
 
 ## 🧱 Tech Stack
 
