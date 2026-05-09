@@ -74,6 +74,12 @@ ALLOWED_EXTENSIONS = {'enc', 'json'}
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
+# Association table for User-Group many-to-many relationship
+user_groups = db.Table('user_groups',
+    db.Column('user_id', db.Integer, db.ForeignKey('user.id'), primary_key=True),
+    db.Column('group_id', db.Integer, db.ForeignKey('group.id'), primary_key=True)
+)
+
 # --- Models ---
 class User(db.Model):
     __tablename__ = 'user'
@@ -104,6 +110,9 @@ class User(db.Model):
     shared_folders = db.relationship('SharedFolder', back_populates='user', cascade='all, delete-orphan')
     logins = db.relationship('LoginLog', back_populates='user', cascade='all, delete-orphan')
 
+    def __init__(self, **kwargs):
+        super(User, self).__init__(**kwargs)
+
 class Folder(db.Model):
     __tablename__ = 'folder'
     id = db.Column(db.Integer, primary_key=True)
@@ -119,6 +128,9 @@ class Folder(db.Model):
     credentials = db.relationship('Credential', back_populates='folder', cascade='all, delete-orphan')
     shared_with = db.relationship('SharedFolder', back_populates='folder', cascade='all, delete-orphan')
 
+    def __init__(self, **kwargs):
+        super(Folder, self).__init__(**kwargs)
+
 class SharedFolder(db.Model):
     __tablename__ = 'shared_folder'
     id = db.Column(db.Integer, primary_key=True)
@@ -130,6 +142,9 @@ class SharedFolder(db.Model):
 
     folder = db.relationship('Folder', back_populates='shared_with')
     user = db.relationship('User', back_populates='shared_folders')
+
+    def __init__(self, **kwargs):
+        super(SharedFolder, self).__init__(**kwargs)
 
 class Credential(db.Model):
     __tablename__ = 'credential'
@@ -145,6 +160,9 @@ class Credential(db.Model):
     folder = db.relationship('Folder', back_populates='credentials')
     user = db.relationship('User', back_populates='credentials')
 
+    def __init__(self, **kwargs):
+        super(Credential, self).__init__(**kwargs)
+
 class Notification(db.Model):
     __tablename__ = 'notification'
     id = db.Column(db.Integer, primary_key=True)
@@ -155,6 +173,9 @@ class Notification(db.Model):
 
     recipient = db.relationship('User', back_populates='notifications')
 
+    def __init__(self, **kwargs):
+        super(Notification, self).__init__(**kwargs)
+
 class LoginLog(db.Model):
     __tablename__ = 'login_log'
     id = db.Column(db.Integer, primary_key=True)
@@ -163,6 +184,18 @@ class LoginLog(db.Model):
     timestamp = db.Column(db.DateTime, default=datetime.utcnow)
 
     user = db.relationship('User', back_populates='logins')
+
+    def __init__(self, **kwargs):
+        super(LoginLog, self).__init__(**kwargs)
+
+class Group(db.Model):
+    __tablename__ = 'group'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), unique=True, nullable=False)
+    members = db.relationship('User', secondary=user_groups, backref=db.backref('user_groups', lazy='dynamic'))
+
+    def __init__(self, **kwargs):
+        super(Group, self).__init__(**kwargs)
 
 with app.app_context():
     db.create_all()
@@ -1066,7 +1099,62 @@ def export_credentials():
     )
 
 
+@app.route('/admin/groups', methods=['GET', 'POST'])
+@admin_required
+def manage_groups():
+    if request.method == 'POST':
+        name = request.form.get('group_name')
+        if name:
+            if not Group.query.filter_by(name=name).first():
+                new_group = Group(name=name)
+                db.session.add(new_group)
+                db.session.commit()
+                flash(f"✅ Group '{name}' created.")
+            else:
+                flash(f"❌ Group '{name}' already exists.")
+        return redirect(url_for('manage_groups'))
+    
+    groups = Group.query.all()
+    users = User.query.all()
     return render_template("admin_groups.html", groups=groups, users=users)
+
+@app.route('/admin/rename_group/<int:group_id>', methods=['POST'])
+@admin_required
+def rename_group(group_id):
+    group = Group.query.get_or_404(group_id)
+    new_name = request.form.get('new_name')
+    if new_name:
+        group.name = new_name
+        db.session.commit()
+        flash(f"✅ Group renamed to '{new_name}'.")
+    return redirect(url_for('manage_groups'))
+
+@app.route('/admin/delete_group/<int:group_id>', methods=['POST'])
+@admin_required
+def delete_group(group_id):
+    group = Group.query.get_or_404(group_id)
+    name = group.name
+    db.session.delete(group)
+    db.session.commit()
+    flash(f"✅ Group '{name}' deleted.")
+    return redirect(url_for('manage_groups'))
+
+@app.route('/admin/update_group_members/<int:group_id>', methods=['POST'])
+@admin_required
+def update_group_members(group_id):
+    group = Group.query.get_or_404(group_id)
+    user_ids = request.form.getlist('user_ids')
+    
+    # Update members
+    group.members = []
+    for uid in user_ids:
+        u = User.query.get(int(uid))
+        if u:
+            group.members.append(u)
+    
+    db.session.commit()
+    flash(f"✅ Members updated for group '{group.name}'.")
+    return redirect(url_for('manage_groups'))
 
 @app.route('/admin/reset_2fa/<int:id>', methods=['POST'])
 @admin_required
