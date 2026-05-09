@@ -1,59 +1,39 @@
 from flask import Flask, render_template, request, redirect, flash, url_for, session
-from cryptography.fernet import Fernet
 from functools import wraps
 from flask_sqlalchemy import SQLAlchemy
-from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
+from datetime import datetime, timedelta
 import json
+import os
+import re
+import base64
 from io import BytesIO
 from flask import send_file
 from flask_wtf import FlaskForm, CSRFProtect
+from flask_session import Session
 from wtforms import StringField, PasswordField, SubmitField
 from wtforms.validators import DataRequired
-from flask_wtf import FlaskForm
-from wtforms import StringField, PasswordField, SubmitField
-from wtforms.validators import DataRequired
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-from cryptography.hazmat.primitives import hashes
-import base64, os
-from datetime import timedelta
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 from werkzeug.exceptions import RequestEntityTooLarge
-import re
-from datetime import datetime
-from flask_migrate import Migrate 
+from flask_migrate import Migrate
 import pyotp
 import qrcode
 from dotenv import load_dotenv
-from flask import send_file
 
-
-
+# XPass crypto module — per-user zero-knowledge encryption
+from crypto import (
+    generate_salt, derive_master_key, derive_auth_hash,
+    generate_user_encryption_key, encrypt_user_key, decrypt_user_key,
+    generate_rsa_keypair, encrypt_private_key, decrypt_private_key,
+    generate_folder_key, encrypt_folder_key, decrypt_folder_key,
+    wrap_folder_key_for_recipient, unwrap_folder_key,
+    encrypt_credential, decrypt_credential, derive_export_key,
+)
+from cryptography.fernet import Fernet
 
 # Load .env into environment
-load_dotenv()
-passphrase = os.getenv("FERNET_PASSPHRASE")
-salt_b64 = os.getenv("FERNET_SALT")
-
-if not passphrase or not salt_b64:
-    raise RuntimeError("Missing FERNET_PASSPHRASE or FERNET_SALT in environment")
-
-try:
-    salt = base64.b64decode(salt_b64)
-except Exception as e:
-    raise ValueError("Invalid base64-encoded FERNET_SALT") from e
-
-# Derive the key using PBKDF2
-kdf = PBKDF2HMAC(
-    algorithm=hashes.SHA256(),
-    length=32,
-    salt=salt,
-    iterations=200_000,  # strong against brute-force
-)
-
-derived_key = base64.urlsafe_b64encode(kdf.derive(passphrase.encode()))
-fernet = Fernet(derived_key)
+basedir = os.path.abspath(os.path.dirname(__file__))
+load_dotenv(os.path.join(basedir, '.env'), override=True)
 FORCE_2FA = os.getenv("FORCE_2FA", "False").lower() == "true"
 
 
@@ -72,6 +52,10 @@ app.config['SESSION_COOKIE_HTTPONLY'] = True
 app.config['SESSION_COOKIE_SECURE'] = False  # set to True in production
 app.config['SESSION_COOKIE_SAMESITE'] = 'Lax'
 
+# Session configuration (server-side to store keys securely)
+app.config['SESSION_TYPE'] = 'filesystem'
+Session(app)
+
 app.permanent_session_lifetime = timedelta(minutes=30)
 limiter = Limiter(key_func=get_remote_address)
 limiter.init_app(app)
@@ -81,11 +65,142 @@ csrf = CSRFProtect(app)
 db = SQLAlchemy(app)
 migrate = Migrate(app, db)
 
+class LoginForm(FlaskForm):
+    identifier = StringField("Email or Username", validators=[DataRequired()])
+    password = PasswordField("Password", validators=[DataRequired()])
+    submit = SubmitField("Login")
+
 ALLOWED_EXTENSIONS = {'enc', 'json'}
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-# Decorators
+# Association table for User-Group many-to-many relationship
+user_groups = db.Table('user_groups',
+    db.Column('user_id', db.Integer, db.ForeignKey('user.id'), primary_key=True),
+    db.Column('group_id', db.Integer, db.ForeignKey('group.id'), primary_key=True)
+)
+
+# --- Models ---
+class User(db.Model):
+    __tablename__ = 'user'
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(100), unique=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    role = db.Column(db.String(20), default='user')
+
+    # Authentication
+    auth_hash = db.Column(db.String(255), nullable=False)
+    auth_salt = db.Column(db.LargeBinary, nullable=False)
+
+    # Per-user encryption infrastructure
+    encrypted_user_key = db.Column(db.LargeBinary, nullable=True)
+    user_key_salt = db.Column(db.LargeBinary, nullable=True)
+    user_key_iterations = db.Column(db.Integer, default=600_000)
+    rsa_public_key = db.Column(db.Text, nullable=True)
+    encrypted_rsa_private_key = db.Column(db.LargeBinary, nullable=True)
+
+    # 2FA
+    twofa_secret = db.Column(db.String(32))
+    twofa_enabled = db.Column(db.Boolean, default=False)
+
+    # Relationships
+    folders = db.relationship('Folder', back_populates='user', cascade='all, delete-orphan')
+    credentials = db.relationship('Credential', back_populates='user', cascade='all, delete-orphan')
+    notifications = db.relationship('Notification', back_populates='recipient', cascade='all, delete-orphan')
+    shared_folders = db.relationship('SharedFolder', back_populates='user', cascade='all, delete-orphan')
+    logins = db.relationship('LoginLog', back_populates='user', cascade='all, delete-orphan')
+
+    def __init__(self, **kwargs):
+        super(User, self).__init__(**kwargs)
+
+class Folder(db.Model):
+    __tablename__ = 'folder'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(255), nullable=False)
+    parent_id = db.Column(db.Integer, db.ForeignKey('folder.id'), nullable=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+    # Per-folder encryption key
+    encrypted_folder_key = db.Column(db.LargeBinary, nullable=True)
+
+    user = db.relationship('User', back_populates='folders')
+    parent = db.relationship('Folder', remote_side=[id], backref=db.backref('children', cascade='all, delete-orphan'))
+    credentials = db.relationship('Credential', back_populates='folder', cascade='all, delete-orphan')
+    shared_with = db.relationship('SharedFolder', back_populates='folder', cascade='all, delete-orphan')
+
+    def __init__(self, **kwargs):
+        super(Folder, self).__init__(**kwargs)
+
+class SharedFolder(db.Model):
+    __tablename__ = 'shared_folder'
+    id = db.Column(db.Integer, primary_key=True)
+    folder_id = db.Column(db.Integer, db.ForeignKey('folder.id'), nullable=False)
+    shared_with_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+
+    # RSA-wrapped folder key envelope for recipient
+    encrypted_folder_key_envelope = db.Column(db.LargeBinary, nullable=True)
+
+    folder = db.relationship('Folder', back_populates='shared_with')
+    user = db.relationship('User', back_populates='shared_folders')
+
+    def __init__(self, **kwargs):
+        super(SharedFolder, self).__init__(**kwargs)
+
+class Credential(db.Model):
+    __tablename__ = 'credential'
+    id = db.Column(db.Integer, primary_key=True)
+    folder_id = db.Column(db.Integer, db.ForeignKey('folder.id'), nullable=False)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    name = db.Column(db.String(255), nullable=False)
+    url = db.Column(db.String(255), nullable=False)
+    username = db.Column(db.String(255), nullable=True)
+    password = db.Column(db.Text, nullable=False)
+    notes = db.Column(db.Text)
+
+    folder = db.relationship('Folder', back_populates='credentials')
+    user = db.relationship('User', back_populates='credentials')
+
+    def __init__(self, **kwargs):
+        super(Credential, self).__init__(**kwargs)
+
+class Notification(db.Model):
+    __tablename__ = 'notification'
+    id = db.Column(db.Integer, primary_key=True)
+    recipient_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
+    message = db.Column(db.String(255), nullable=False)
+    is_read = db.Column(db.Boolean, default=False)
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+
+    recipient = db.relationship('User', back_populates='notifications')
+
+    def __init__(self, **kwargs):
+        super(Notification, self).__init__(**kwargs)
+
+class LoginLog(db.Model):
+    __tablename__ = 'login_log'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
+    ip_address = db.Column(db.String(45))
+    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
+
+    user = db.relationship('User', back_populates='logins')
+
+    def __init__(self, **kwargs):
+        super(LoginLog, self).__init__(**kwargs)
+
+class Group(db.Model):
+    __tablename__ = 'group'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), unique=True, nullable=False)
+    members = db.relationship('User', secondary=user_groups, backref=db.backref('user_groups', lazy='dynamic'))
+
+    def __init__(self, **kwargs):
+        super(Group, self).__init__(**kwargs)
+
+with app.app_context():
+    db.create_all()
+
+# --- Helpers ---
 def login_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -112,15 +227,6 @@ def login_required(f):
     return wrapper
 
 
-
-def derive_export_key(password, salt):
-    kdf = PBKDF2HMAC(
-        algorithm=hashes.SHA256(),
-        length=32,
-        salt=salt,
-        iterations=100_000
-    )
-    return base64.urlsafe_b64encode(kdf.derive(password.encode()))
 def admin_required(f):
     @wraps(f)
     def wrapper(*args, **kwargs):
@@ -152,78 +258,82 @@ def has_folder_access(user_id, folder):
     return False
 
 
+def get_folder_key_for_user(folder, user_id, uek):
+    """
+    Resolve the folder key for a user. Two paths:
+    1. Owner: decrypt folder.encrypted_folder_key with their UEK
+    2. Shared user: decrypt the RSA envelope in SharedFolder using their RSA private key
+    """
+    if folder.user_id == user_id:
+        # Owner path — decrypt folder key with UEK
+        if not folder.encrypted_folder_key:
+            return None
+        return decrypt_folder_key(folder.encrypted_folder_key, uek)
+
+    # Shared user path — find the envelope
+    share = SharedFolder.query.filter_by(folder_id=folder.id, shared_with_user_id=user_id).first()
+    if not share:
+        # Check parent folders (inherited sharing)
+        parent = folder.parent
+        while parent:
+            share = SharedFolder.query.filter_by(folder_id=parent.id, shared_with_user_id=user_id).first()
+            if share:
+                break
+            parent = parent.parent
+
+    if not share or not share.encrypted_folder_key_envelope:
+        return None
+
+    # Decrypt RSA private key, then unwrap the folder key
+    user = User.query.get(user_id)
+    master_key_b64 = session.get('master_key')
+    if not master_key_b64:
+        return None
+    master_key = base64.urlsafe_b64decode(master_key_b64)
+    master_key = master_key_b64.encode() if isinstance(master_key_b64, str) else master_key_b64
+    # Actually, the master_key stored in session is already the derived Fernet key (base64-encoded bytes)
+    private_pem = decrypt_private_key(user.encrypted_rsa_private_key, master_key_b64.encode())
+    return unwrap_folder_key(share.encrypted_folder_key_envelope, private_pem)
 
 
-# Models
-class LoginForm(FlaskForm):
-    identifier = StringField("Email or Username", validators=[DataRequired()])
-    password = PasswordField("Password", validators=[DataRequired()])
-    submit = SubmitField("Login")
-class LoginLog(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'))
-    ip_address = db.Column(db.String(45))
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-
-    user = db.relationship('User', backref='logins')
-
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(100), unique=True, nullable=False)
-    password = db.Column(db.String(255), nullable=False)
-    role = db.Column(db.String(20), default='user')
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    credentials = db.relationship('Credential', backref='user', cascade='all, delete-orphan')
-    notifications = db.relationship('Notification', back_populates='recipient', cascade='all, delete-orphan')
-    shared_with_me = db.relationship('SharedFolder', foreign_keys='SharedFolder.shared_with_user_id',
-                                 backref='shared_user', cascade='all, delete-orphan')
-
-    twofa_secret = db.Column(db.String(32))
-    twofa_enabled = db.Column(db.Boolean, default=False)
+def get_session_uek():
+    """Get the user encryption key from the session."""
+    uek_b64 = session.get('uek')
+    if not uek_b64:
+        return None
+    return uek_b64.encode() if isinstance(uek_b64, str) else uek_b64
 
 
+def setup_user_keys(password: str):
+    """
+    Generate all cryptographic material for a new user.
+    Returns a dict with all fields to set on the User model.
+    """
+    # Auth path — separate salt and hash
+    auth_salt = generate_salt()
+    auth_hash = derive_auth_hash(password, auth_salt)
 
+    # Encryption path — separate salt
+    user_key_salt = generate_salt()
+    master_key = derive_master_key(password, user_key_salt)
 
+    # Generate User Encryption Key
+    uek = generate_user_encryption_key()
+    encrypted_uek = encrypt_user_key(uek, master_key)
 
+    # Generate RSA keypair
+    public_pem, private_pem = generate_rsa_keypair()
+    encrypted_private = encrypt_private_key(private_pem, master_key)
 
-
-class Folder(db.Model):
-    __tablename__ = 'folder'
-    __table_args__ = {'extend_existing': True}  # ✅ Fix for redeclaration
-
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.String(255), nullable=False)
-    parent_id = db.Column(db.Integer, db.ForeignKey('folder.id'), nullable=True)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-
-    user = db.relationship('User')  # ✅ Safe now that User is defined
-    children = db.relationship('Folder', backref=db.backref('parent', remote_side=[id]))
-    credentials = db.relationship('Credential', backref='folder')
-
-class SharedFolder(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    folder_id = db.Column(db.Integer, db.ForeignKey('folder.id'), nullable=False)
-    shared_with_user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    folder = db.relationship('Folder', backref='shared_with')
-    user = db.relationship('User')
-    
-class Credential(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    folder_id = db.Column(db.Integer, db.ForeignKey('folder.id'), nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    name = db.Column(db.String(255), nullable=False)
-    url = db.Column(db.String(255), nullable=False)
-    password = db.Column(db.String(255), nullable=False)
-    notes = db.Column(db.Text)
-    username = db.Column(db.String(255), nullable=True)
-class Notification(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    recipient_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    message = db.Column(db.String(255), nullable=False)
-    is_read = db.Column(db.Boolean, default=False)
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
-
-    recipient = db.relationship('User', back_populates='notifications')
+    return {
+        'auth_hash': auth_hash,
+        'auth_salt': auth_salt,
+        'encrypted_user_key': encrypted_uek,
+        'user_key_salt': user_key_salt,
+        'user_key_iterations': 600_000,
+        'rsa_public_key': public_pem.decode(),
+        'encrypted_rsa_private_key': encrypted_private,
+    }
 
 with app.app_context():
     db.create_all()
@@ -232,7 +342,6 @@ with app.app_context():
 
 
 
-# Routes
 # Routes
 @limiter.limit("5 per minute")
 
@@ -249,29 +358,46 @@ def login():
             (User.email == identifier) | (User.username == identifier)
         ).first()
 
-        if user and check_password_hash(user.password, password):
-            # ✅ Only require 2FA if it's enabled and globally enforced
-            if FORCE_2FA and user.twofa_enabled:
-                session['pending_2fa_user_id'] = user.id
-                return redirect(url_for('verify_2fa'))
+        if user:
+            # Derive auth hash and compare
+            computed_hash = derive_auth_hash(password, user.auth_salt)
+            
+            if computed_hash == user.auth_hash:
+                # Derive master key and decrypt UEK
+                master_key = derive_master_key(password, user.user_key_salt, user.user_key_iterations)
+                try:
+                    uek = decrypt_user_key(user.encrypted_user_key, master_key)
+                except Exception:
+                    flash('❌ Vault decryption failed. Contact admin.')
+                    return render_template('login.html', form=form)
 
-            # Normal login flow
-            session['user_id'] = user.id
-            session['username'] = user.username
-            session['email'] = user.email
-            session['role'] = user.role
+                # ... (rest of the code)
+                # 2FA check
+                if FORCE_2FA and user.twofa_enabled:
+                    session['pending_2fa_user_id'] = user.id
+                    session['pending_uek'] = uek.decode()
+                    session['pending_master_key'] = master_key.decode()
+                    return redirect(url_for('verify_2fa'))
 
-            db.session.add(LoginLog(
-                user_id=user.id,
-                ip_address=request.remote_addr,
-                timestamp=datetime.utcnow()
-            ))
-            db.session.commit()
+                # Store keys in session
+                session['user_id'] = user.id
+                session['username'] = user.username
+                session['email'] = user.email
+                session['role'] = user.role
+                session['uek'] = uek.decode()            # UEK for vault operations
+                session['master_key'] = master_key.decode()  # For RSA private key decryption
 
-            flash(f'✅ Welcome, {user.username}!')
-            return redirect(url_for('index'))
-        else:
-            flash('❌ Invalid email/username or password.')
+                db.session.add(LoginLog(
+                    user_id=user.id,
+                    ip_address=request.remote_addr,
+                    timestamp=datetime.utcnow()
+                ))
+                db.session.commit()
+
+                flash(f'✅ Welcome, {user.username}!')
+                return redirect(url_for('index'))
+
+        flash('❌ Invalid email/username or password.')
 
     return render_template('login.html', form=form)
 
@@ -359,7 +485,9 @@ def verify_2fa():
             session['username'] = user.username
             session['email'] = user.email
             session['role'] = user.role
-            session.pop('pending_2fa_user_id')
+            session['uek'] = session.pop('pending_uek', None)
+            session['master_key'] = session.pop('pending_master_key', None)
+            session.pop('pending_2fa_user_id', None)
 
             # Log login
             db.session.add(LoginLog(user_id=user.id, ip_address=request.remote_addr))
@@ -396,7 +524,18 @@ def credentials():
         notes = request.form['notes']
         folder_id = request.form['folder_id']
         username = request.form['username']
-        encrypted_pw = fernet.encrypt(password.encode()).decode()
+        
+        folder = Folder.query.get(folder_id)
+        if not folder:
+            flash("Folder not found.")
+            return redirect(url_for('credentials'))
+            
+        folder_key = get_folder_key_for_user(folder, user_id, get_session_uek())
+        if not folder_key:
+            flash('Error: Could not retrieve folder encryption key.')
+            return redirect(url_for('view', folder_id=folder_id))
+
+        encrypted_pw = encrypt_credential(password, folder_key)
 
         if edit_cred and edit_cred.user_id == user_id:
             edit_cred.name = name
@@ -423,16 +562,19 @@ def credentials():
         return redirect(url_for('view', folder_id=folder_id))
 
     if edit_cred:
+        folder_key = get_folder_key_for_user(edit_cred.folder, user_id, get_session_uek())
         try:
-            edit_cred.decrypted_password = fernet.decrypt(edit_cred.password.encode()).decode()
+            edit_cred.decrypted_password = decrypt_credential(edit_cred.password, folder_key) if folder_key else ''
         except:
             edit_cred.decrypted_password = ''
 
     # ✅ Show only own credentials
     own_credentials = Credential.query.filter_by(user_id=user_id).all()
+    uek = get_session_uek()
     for cred in own_credentials:
+        folder_key = get_folder_key_for_user(cred.folder, user_id, uek)
         try:
-            cred.decrypted_password = fernet.decrypt(cred.password.encode()).decode()
+            cred.decrypted_password = decrypt_credential(cred.password, folder_key) if folder_key else '[No Key]'
         except:
             cred.decrypted_password = '[Decryption Failed]'
 
@@ -477,10 +619,12 @@ def search_credentials():
         if query in cred.name.lower() or query in cred.url.lower() or query in (cred.notes or '').lower()
     ]
 
+    uek = get_session_uek()
     # Decrypt and build folder paths
     for cred in filtered:
+        folder_key = get_folder_key_for_user(cred.folder, user_id, uek)
         try:
-            cred.decrypted_password = fernet.decrypt(cred.password.encode()).decode()
+            cred.decrypted_password = decrypt_credential(cred.password, folder_key) if folder_key else '[No Key]'
         except:
             cred.decrypted_password = '[Decryption Failed]'
 
@@ -527,9 +671,11 @@ def view():
     raw_credentials = Credential.query.filter_by(folder_id=folder_id).all()
     credentials = [c for c in raw_credentials if has_folder_access(user_id, c.folder)]
 
+    uek = get_session_uek()
     for cred in credentials:
+        folder_key = get_folder_key_for_user(cred.folder, user_id, uek)
         try:
-            cred.decrypted_password = fernet.decrypt(cred.password.encode()).decode()
+            cred.decrypted_password = decrypt_credential(cred.password, folder_key) if folder_key else '[No Key]'
         except:
             cred.decrypted_password = '[Decryption Failed]'
 
@@ -567,7 +713,24 @@ def share_folder():
     if existing:
         flash('Already shared.')
     else:
-        shared = SharedFolder(folder_id=folder_id, shared_with_user_id=user_id)
+        shared_user = User.query.get(user_id)
+        if not shared_user or not shared_user.rsa_public_key:
+            flash("Cannot share with this user (missing RSA public key).")
+            return redirect(url_for('folders'))
+            
+        # Owner needs to retrieve the folder key to wrap it
+        folder_key = get_folder_key_for_user(folder, session['user_id'], get_session_uek())
+        if not folder_key:
+            flash("Error: Could not retrieve folder encryption key for sharing.")
+            return redirect(url_for('folders'))
+            
+        envelope = wrap_folder_key_for_recipient(folder_key, shared_user.rsa_public_key.encode())
+
+        shared = SharedFolder(
+            folder_id=folder_id,
+            shared_with_user_id=user_id,
+            encrypted_folder_key_envelope=envelope
+        )
         db.session.add(shared)
 
         # Create and add notification
@@ -648,6 +811,11 @@ def folders():
             return redirect(url_for('folders'))
 
         new_folder = Folder(name=name, parent_id=parent_id, user_id=session['user_id'])
+        
+        # Generate new per-folder key and encrypt it with user's UEK
+        folder_key = generate_folder_key()
+        new_folder.encrypted_folder_key = encrypt_folder_key(folder_key, get_session_uek())
+        
         db.session.add(new_folder)
         db.session.commit()
         flash('Folder created successfully!')
@@ -721,11 +889,12 @@ def manage_users():
         if User.query.filter((User.username == username) | (User.email == email)).first():
             flash('❌ Username or Email already exists.')
         else:
+            user_keys = setup_user_keys(password)
             user = User(
                 username=username,
                 email=email,
-                password=generate_password_hash(password),
-                role=role
+                role=role,
+                **user_keys
             )
             db.session.add(user)
             db.session.commit()
@@ -757,9 +926,12 @@ def reset_password(id):
         flash("❌ Password must be at least 6 characters long and include 1 uppercase letter, 1 lowercase letter, 1 number, and 1 special character.")
         return redirect(url_for('manage_users'))
 
-    user.password = generate_password_hash(new_password)
+    user_keys = setup_user_keys(new_password)
+    for key, value in user_keys.items():
+        setattr(user, key, value)
+        
     db.session.commit()
-    flash("✅ Password has been reset!")
+    flash("✅ Password has been reset! Note: Previous vault data is unrecoverable (Zero-Knowledge Architecture).")
     return redirect(url_for('manage_users'))
 @app.route('/admin/edit_user', methods=['POST'])
 @admin_required
@@ -841,6 +1013,11 @@ def import_export():
                 decrypted = f.decrypt(encrypted)
                 data = json.loads(decrypted)
 
+                target_folder = Folder.query.get(target_folder_id)
+                folder_key = get_folder_key_for_user(target_folder, session['user_id'], get_session_uek())
+                if not folder_key:
+                    raise ValueError("Cannot access target folder encryption key")
+
                 for item in data:
                     new_cred = Credential(
                         folder_id=target_folder_id,  # 👈 overwrite destination
@@ -848,7 +1025,7 @@ def import_export():
                         name=item['name'],
                         url=item['url'],
                         username=item.get('username', ''),
-                        password=item['password'],
+                        password=encrypt_credential(item['password'], folder_key),
                         notes=item.get('notes', '')
                     )
                     db.session.add(new_cred)
@@ -880,6 +1057,12 @@ def export_credentials():
         flash("❌ Folder must be selected for export")
         return redirect(url_for('import_export'))
 
+    folder = Folder.query.get(folder_id)
+    folder_key = get_folder_key_for_user(folder, session['user_id'], get_session_uek())
+    if not folder_key:
+        flash("❌ Cannot access folder encryption key")
+        return redirect(url_for('import_export'))
+
     creds = Credential.query.filter_by(user_id=session['user_id'], folder_id=folder_id).all()
     if not creds:
         flash("❌ No credentials found in selected folder")
@@ -890,7 +1073,7 @@ def export_credentials():
             "name": c.name,
             "url": c.url,
             "username": c.username,
-            "password": c.password,
+            "password": decrypt_credential(c.password, folder_key),
             "notes": c.notes,
             "folder_id": folder_id  # retain original
         }
@@ -916,7 +1099,62 @@ def export_credentials():
     )
 
 
+@app.route('/admin/groups', methods=['GET', 'POST'])
+@admin_required
+def manage_groups():
+    if request.method == 'POST':
+        name = request.form.get('group_name')
+        if name:
+            if not Group.query.filter_by(name=name).first():
+                new_group = Group(name=name)
+                db.session.add(new_group)
+                db.session.commit()
+                flash(f"✅ Group '{name}' created.")
+            else:
+                flash(f"❌ Group '{name}' already exists.")
+        return redirect(url_for('manage_groups'))
+    
+    groups = Group.query.all()
+    users = User.query.all()
     return render_template("admin_groups.html", groups=groups, users=users)
+
+@app.route('/admin/rename_group/<int:group_id>', methods=['POST'])
+@admin_required
+def rename_group(group_id):
+    group = Group.query.get_or_404(group_id)
+    new_name = request.form.get('new_name')
+    if new_name:
+        group.name = new_name
+        db.session.commit()
+        flash(f"✅ Group renamed to '{new_name}'.")
+    return redirect(url_for('manage_groups'))
+
+@app.route('/admin/delete_group/<int:group_id>', methods=['POST'])
+@admin_required
+def delete_group(group_id):
+    group = Group.query.get_or_404(group_id)
+    name = group.name
+    db.session.delete(group)
+    db.session.commit()
+    flash(f"✅ Group '{name}' deleted.")
+    return redirect(url_for('manage_groups'))
+
+@app.route('/admin/update_group_members/<int:group_id>', methods=['POST'])
+@admin_required
+def update_group_members(group_id):
+    group = Group.query.get_or_404(group_id)
+    user_ids = request.form.getlist('user_ids')
+    
+    # Update members
+    group.members = []
+    for uid in user_ids:
+        u = User.query.get(int(uid))
+        if u:
+            group.members.append(u)
+    
+    db.session.commit()
+    flash(f"✅ Members updated for group '{group.name}'.")
+    return redirect(url_for('manage_groups'))
 
 @app.route('/admin/reset_2fa/<int:id>', methods=['POST'])
 @admin_required
