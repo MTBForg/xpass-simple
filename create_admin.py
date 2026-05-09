@@ -15,11 +15,13 @@ def create_admin():
         print("❌ Username already exists.")
         return
 
+    from app import setup_user_keys
+    admin_keys = setup_user_keys(password)
     admin = User(
         username=username,
         email=email,
-        password=generate_password_hash(password),
-        role='admin'
+        role='admin',
+        **admin_keys
     )
     db.session.add(admin)
     db.session.commit()
