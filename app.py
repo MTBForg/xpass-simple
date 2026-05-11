@@ -371,7 +371,6 @@ def login():
                     flash('❌ Vault decryption failed. Contact admin.')
                     return render_template('login.html', form=form)
 
-                # ... (rest of the code)
                 # 2FA check
                 if FORCE_2FA and user.twofa_enabled:
                     session['pending_2fa_user_id'] = user.id
